@@ -13,15 +13,19 @@ public class LoginWindow : Window, IDisposable
     private string password = string.Empty;
     private bool rememberMe = false;
     private string statusMessage = string.Empty;
+    private bool loginError;
     private bool isLoggingIn = false;
 
     public LoginWindow(Plugin plugin)
-        : base("FFLogs Login##FFLogsLogin", ImGuiWindowFlags.NoResize | ImGuiWindowFlags.NoCollapse)
+        : base(Loc.Text("FFLogs Login") + "###FFLogsLogin", ImGuiWindowFlags.AlwaysAutoResize | ImGuiWindowFlags.NoCollapse)
     {
         this.plugin = plugin;
         
-        Size = new Vector2(350, 200);
-        SizeCondition = ImGuiCond.Always;
+        SizeConstraints = new WindowSizeConstraints
+        {
+            MinimumSize = new Vector2(350, 0),
+            MaximumSize = new Vector2(350, float.MaxValue)
+        };
 
         // Load saved credentials if available
         if (plugin.Configuration.RememberCredentials)
@@ -36,38 +40,40 @@ public class LoginWindow : Window, IDisposable
 
     public override void Draw()
     {
-        ImGui.Text("Log in to FFLogs");
+        ImGui.Text(Loc.Text("Log in to FFLogs"));
         ImGui.Separator();
         ImGui.Spacing();
 
+        ImGui.Text(Loc.Text("Email"));
         ImGui.SetNextItemWidth(-1);
-        ImGui.InputTextWithHint("##email", "Email", ref email, 256);
+        ImGui.InputText("##email", ref email, 256);
 
+        ImGui.Text(Loc.Text("Password"));
         ImGui.SetNextItemWidth(-1);
-        ImGui.InputTextWithHint("##password", "Password", ref password, 256, ImGuiInputTextFlags.Password);
+        ImGui.InputText("##password", ref password, 256, ImGuiInputTextFlags.Password);
 
-        ImGui.Checkbox("Remember me", ref rememberMe);
+        ImGui.Checkbox(Loc.Text("Remember me"), ref rememberMe);
 
         ImGui.Spacing();
 
-        if (isLoggingIn)
-            ImGui.BeginDisabled();
+        ImGui.BeginDisabled(isLoggingIn);
 
-        if (ImGui.Button(isLoggingIn ? "Logging in..." : "Login", new Vector2(-1, 30)))
+        if (ImGui.Button(isLoggingIn ? Loc.Text("Logging in...") : Loc.Text("Login"), new Vector2(-1, 30)))
         {
             _ = DoLogin();
         }
 
-        if (isLoggingIn)
-            ImGui.EndDisabled();
+        ImGui.EndDisabled();
 
         if (!string.IsNullOrEmpty(statusMessage))
         {
             ImGui.Spacing();
-            var color = statusMessage.StartsWith("Error") 
+            var color = loginError
                 ? new Vector4(1, 0.3f, 0.3f, 1) 
                 : new Vector4(0.3f, 1, 0.3f, 1);
-            ImGui.TextColored(color, statusMessage);
+            ImGui.PushStyleColor(ImGuiCol.Text, color);
+            ImGui.TextWrapped(statusMessage);
+            ImGui.PopStyleColor();
         }
     }
 
@@ -75,12 +81,14 @@ public class LoginWindow : Window, IDisposable
     {
         if (string.IsNullOrWhiteSpace(email) || string.IsNullOrWhiteSpace(password))
         {
-            statusMessage = "Error: Please enter email and password";
+            loginError = true;
+            statusMessage = Loc.Text("Error: Please enter email and password");
             return;
         }
 
         isLoggingIn = true;
-        statusMessage = "Logging in...";
+        loginError = false;
+        statusMessage = Loc.Text("Logging in...");
 
         try
         {
@@ -102,17 +110,19 @@ public class LoginWindow : Window, IDisposable
                 }
                 plugin.Configuration.Save();
 
-                statusMessage = "Login successful!";
+                statusMessage = Loc.Text("Login successful!");
                 plugin.ShowMainWindow();
             }
             else
             {
-                statusMessage = "Error: Login failed. Check credentials.";
+                loginError = true;
+                statusMessage = Loc.Text("Error: Login failed. Check credentials.");
             }
         }
         catch (Exception ex)
         {
-            statusMessage = $"Error: {ex.Message}";
+            loginError = true;
+            statusMessage = Loc.Text("Could not complete login. See the plugin log for details.");
             Plugin.Log.Error(ex, "Login failed");
         }
         finally

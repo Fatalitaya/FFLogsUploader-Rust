@@ -25,13 +25,13 @@ public class MainWindow : Window, IDisposable
     private string description = string.Empty;
     private bool uploadPreviousFights = true;
 
-    private string statusMessage = string.Empty;
-    private bool isProcessing = false;
+    private volatile string statusMessage = string.Empty;
+    private volatile bool isProcessing = false;
 
-    private readonly string[] visibilities = { "Public", "Private", "Unlisted" };
+    private readonly string[] visibilities = { Loc.Text("Public"), Loc.Text("Private"), Loc.Text("Unlisted") };
 
     public MainWindow(Plugin plugin)
-        : base("FFLogs Uploader##FFLogsMain", ImGuiWindowFlags.NoCollapse)
+        : base(Loc.Text("FFLogs Uploader") + "###FFLogsMain", ImGuiWindowFlags.NoCollapse)
     {
         this.plugin = plugin;
 
@@ -79,13 +79,13 @@ public class MainWindow : Window, IDisposable
 
         if (ImGui.BeginTabBar("FFLogsTabs"))
         {
-            if (ImGui.BeginTabItem("Live Log"))
+            if (ImGui.BeginTabItem(Loc.Text("Live Log")))
             {
                 DrawLiveLogTab();
                 ImGui.EndTabItem();
             }
 
-            if (ImGui.BeginTabItem("Upload a Log"))
+            if (ImGui.BeginTabItem(Loc.Text("Upload a Log")))
             {
                 DrawUploadTab();
                 ImGui.EndTabItem();
@@ -97,10 +97,10 @@ public class MainWindow : Window, IDisposable
 
     private void DrawHeader()
     {
-        var displayName = plugin.FFLogsService.Username ?? plugin.Configuration.Email ?? "Unknown";
-        ImGui.Text($"Logged in as: {displayName}");
+        var displayName = plugin.FFLogsService.Username ?? plugin.Configuration.Email ?? Loc.Text("Unknown");
+        ImGui.Text(Loc.Format("Logged in as: {0}", displayName));
         ImGui.SameLine(ImGui.GetWindowWidth() - 80);
-        if (ImGui.Button("Log Out"))
+        if (ImGui.Button(Loc.Text("Log Out")))
         {
             plugin.FFLogsService.Logout();
             plugin.ShowLoginWindow();
@@ -109,19 +109,19 @@ public class MainWindow : Window, IDisposable
 
     private void DrawLiveLogTab()
     {
+        var live = plugin.FFLogsService.LiveState;
         ImGui.Spacing();
-        ImGui.Text("Choose the directory that the ACT FFXIV plug-in writes logs to:");
+        ImGui.Text(Loc.Text("Choose the directory that the ACT FFXIV plug-in writes logs to:"));
         ImGui.SetNextItemWidth(-80);
         
-        if (plugin.FFLogsService.IsLiveLogging)
-            ImGui.BeginDisabled();
+        ImGui.BeginDisabled(live.Active);
         
         ImGui.InputText("##logdir", ref logPath, 512);
         ImGui.SameLine();
-        if (ImGui.Button("Browse##dir"))
+        if (ImGui.Button(Loc.Text("Browse") + "###dir"))
         {
             fileDialogManager.OpenFolderDialog(
-                "Select Log Directory",
+                Loc.Text("Select Log Directory"),
                 (success, path) =>
                 {
                     if (success && !string.IsNullOrEmpty(path))
@@ -130,48 +130,42 @@ public class MainWindow : Window, IDisposable
                 GetDialogStartPath());
         }
 
-        if (plugin.FFLogsService.IsLiveLogging)
-            ImGui.EndDisabled();
-
         ImGui.Spacing();
-        
-        if (plugin.FFLogsService.IsLiveLogging)
-            ImGui.BeginDisabled();
             
         DrawSharedOptions();
         ImGui.Spacing();
 
-        ImGui.Checkbox("Include the Entire File in the Report", ref uploadPreviousFights);
+        ImGui.Checkbox(Loc.Text("Include the Entire File in the Report"), ref uploadPreviousFights);
         
-        if (plugin.FFLogsService.IsLiveLogging)
-            ImGui.EndDisabled();
+        ImGui.EndDisabled();
             
         ImGui.Spacing();
 
-        if (plugin.FFLogsService.IsLiveLogging)
+        DrawProgress(live.Progress);
+        if (live.Active)
         {
             ImGui.TextColored(new Vector4(0.2f, 0.8f, 0.2f, 1.0f), 
-                $"● Live logging active - {plugin.FFLogsService.LiveFightCount} fight(s) uploaded");
-            ImGui.Text($"Report: {plugin.FFLogsService.CurrentReportCode ?? "unknown"}");
+                Loc.Format("● Live logging active - {0} fight(s) uploaded", live.FightCount));
+            ImGui.Text(Loc.Format("Report: {0}", live.ReportCode ?? Loc.Text("Unknown")));
             ImGui.Spacing();
             
             ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.7f, 0.2f, 0.2f, 1.0f));
             ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.8f, 0.3f, 0.3f, 1.0f));
             ImGui.PushStyleColor(ImGuiCol.ButtonActive, new Vector4(0.9f, 0.1f, 0.1f, 1.0f));
             
-            if (ImGui.Button("Stop Live Logging", new Vector2(-1, 40)))
+            if (ImGui.Button(Loc.Text("Stop Live Logging"), new Vector2(-1, 40)))
             {
                 plugin.FFLogsService.StopLiveLog();
             }
             
             ImGui.PopStyleColor(3);
             
-            if (plugin.FFLogsService.LiveFightCount > 0 && !string.IsNullOrEmpty(plugin.FFLogsService.CurrentReportCode))
+            if (live.FightCount > 0 && !string.IsNullOrEmpty(live.ReportCode))
             {
                 ImGui.Spacing();
-                if (ImGui.Button("View Parses", new Vector2(-1, 30)))
+                if (ImGui.Button(Loc.Text("View Parses"), new Vector2(-1, 30)))
                 {
-                    plugin.ShowParseViewer(plugin.FFLogsService.CurrentReportCode);
+                    plugin.ShowParseViewer(live.ReportCode);
                 }
             }
         }
@@ -181,7 +175,7 @@ public class MainWindow : Window, IDisposable
             ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(0.3f, 0.6f, 0.3f, 1.0f));
             ImGui.PushStyleColor(ImGuiCol.ButtonActive, new Vector4(0.1f, 0.7f, 0.1f, 1.0f));
             
-            if (ImGui.Button("Start Live Logging", new Vector2(-1, 40)))
+            if (ImGui.Button(Loc.Text("Start Live Logging"), new Vector2(-1, 40)))
             {
                 StartLiveLog();
             }
@@ -193,15 +187,15 @@ public class MainWindow : Window, IDisposable
     private void DrawUploadTab()
     {
         ImGui.Spacing();
-        ImGui.Text("Choose the file you want to upload:");
+        ImGui.Text(Loc.Text("Choose the file you want to upload:"));
         ImGui.SetNextItemWidth(-80);
         ImGui.InputText("##logfile", ref logPath, 512);
         ImGui.SameLine();
-        if (ImGui.Button("Browse##file"))
+        if (ImGui.Button(Loc.Text("Browse") + "###file"))
         {
             fileDialogManager.OpenFileDialog(
-                "Select Log File",
-                "Log files{.log},All files{.*}",
+                Loc.Text("Select Log File"),
+                Loc.Text("Log files") + "{.log}," + Loc.Text("All files") + "{.*}",
                 (success, paths) =>
                 {
                     if (success && paths.Count > 0)
@@ -215,16 +209,17 @@ public class MainWindow : Window, IDisposable
         DrawSharedOptions();
         ImGui.Spacing();
 
-        DrawGoButton("Go!", StartUpload);
+        DrawGoButton(Loc.Text("Go!"), StartUpload);
 
+        if (isProcessing) DrawProgress(plugin.ParserService.BulkProgress);
         DrawStatus();
     }
 
     private void DrawSharedOptions()
     {
-        ImGui.Text("Choose the guild you want to upload to:");
+        ImGui.Text(Loc.Text("Choose the guild you want to upload to:"));
         
-        var guildList = new List<(string? Id, string Name)> { (null, "Personal Logs") };
+        var guildList = new List<(string? Id, string Name)> { (null, Loc.Text("Personal Logs")) };
         foreach (var guild in plugin.FFLogsService.Guilds)
         {
             guildList.Add((guild.Id, guild.Name));
@@ -243,16 +238,16 @@ public class MainWindow : Window, IDisposable
 
         if (selectedGuildIndex == 0)
         {
-            ImGui.SetNextItemWidth(60);
+            ImGui.SetNextItemWidth(85);
             ImGui.Combo("##region", ref selectedRegion, FFLogsRegionExtensions.DisplayNames, FFLogsRegionExtensions.DisplayNames.Length);
             ImGui.SameLine();
         }
 
-        ImGui.SetNextItemWidth(80);
+        ImGui.SetNextItemWidth(120);
         ImGui.Combo("##visibility", ref selectedVisibility, visibilities, visibilities.Length);
 
         ImGui.Spacing();
-        ImGui.Text("Enter a description for the report:");
+        ImGui.Text(Loc.Text("Enter a description for the report:"));
         ImGui.SetNextItemWidth(-1);
         ImGui.InputText("##description", ref description, 256);
     }
@@ -292,13 +287,28 @@ public class MainWindow : Window, IDisposable
 
     private void DrawGoButton(string label, Action action)
     {
-        if (isProcessing) ImGui.BeginDisabled();
+        var processing = isProcessing;
+        ImGui.BeginDisabled(processing);
 
         ImGui.SetCursorPosX(ImGui.GetWindowWidth() - 115);
-        if (ImGui.Button(isProcessing ? "Processing..." : label, new Vector2(100, 30)))
+        if (ImGui.Button(processing ? Loc.Text("Processing...") : label, new Vector2(100, 30)))
             action();
 
-        if (isProcessing) ImGui.EndDisabled();
+        ImGui.EndDisabled();
+    }
+
+    private static void DrawProgress(FFLogsPlugin.Services.UploadProgress? progress)
+    {
+        if (progress == null) return;
+        ImGui.TextWrapped(progress.Stage);
+        if (progress.Total > 0)
+        {
+            float fraction = Math.Clamp((float)progress.Position / progress.Total, 0, 1);
+            var label = progress.BytesPending
+                ? Loc.Format("{0:N0} bytes pending", progress.Total - progress.Position)
+                : Loc.Format("{0:P0} ({1:N0}/{2:N0})", fraction, progress.Position, progress.Total);
+            ImGui.ProgressBar(fraction, new Vector2(-1, 0), label);
+        }
     }
 
     private void DrawStatus()
@@ -309,12 +319,12 @@ public class MainWindow : Window, IDisposable
             ImGui.TextWrapped(statusMessage);
 
             // Show View Parses button when upload is complete
-            if (statusMessage.StartsWith("Upload complete!") && plugin.FFLogsService.RecentReportCodes.Count > 0)
+            if (lastUploadedReport != null)
             {
                 ImGui.Spacing();
-                if (ImGui.Button("View Parses##status", new Vector2(-1, 30)))
+                if (ImGui.Button(Loc.Text("View Parses") + "###status", new Vector2(-1, 30)))
                 {
-                    plugin.ShowParseViewer(plugin.FFLogsService.RecentReportCodes[0]);
+                    plugin.ShowParseViewer(lastUploadedReport);
                 }
             }
         }
@@ -322,9 +332,10 @@ public class MainWindow : Window, IDisposable
 
     private void StartLiveLog()
     {
+        lastUploadedReport = null;
         if (string.IsNullOrWhiteSpace(logPath))
         {
-            statusMessage = "Please enter a log directory path first.";
+            statusMessage = Loc.Text("Please enter a log directory path first.");
             return;
         }
 
@@ -348,16 +359,19 @@ public class MainWindow : Window, IDisposable
         }
         catch (Exception ex)
         {
-            statusMessage = $"Error: {ex.Message}";
+            statusMessage = Loc.Format("Error: {0}", ex.Message);
             Plugin.Log.Error(ex, "Live log failed");
         }
     }
 
+    private volatile string? lastUploadedReport;
+
     private void StartUpload()
     {
+        lastUploadedReport = null;
         if (string.IsNullOrWhiteSpace(logPath))
         {
-            statusMessage = "Please select a log file first.";
+            statusMessage = Loc.Text("Please select a log file first.");
             return;
         }
 
@@ -369,12 +383,12 @@ public class MainWindow : Window, IDisposable
 
         if (!System.IO.File.Exists(logPath))
         {
-            statusMessage = "No log files found in the specified directory.";
+            statusMessage = Loc.Text("No log files found in the specified directory.");
             return;
         }
 
         SaveConfig();
-        statusMessage = "Uploading...";
+        statusMessage = Loc.Text("Uploading...");
         isProcessing = true;
         _ = DoUpload();
     }
@@ -385,11 +399,12 @@ public class MainWindow : Window, IDisposable
         {
             var guildId = GetSelectedGuildId();
             var reportCode = await plugin.FFLogsService.UploadLogAsync(logPath, FFLogsRegionExtensions.ComboIndexToApiValue(selectedRegion), selectedVisibility, guildId, description);
-            statusMessage = $"Upload complete! Report: {reportCode}";
+            lastUploadedReport = reportCode;
+            statusMessage = Loc.Format("Upload complete! Report: {0}", reportCode);
         }
         catch (Exception ex)
         {
-            statusMessage = $"Error: {ex.Message}";
+            statusMessage = Loc.Format("Error: {0}", ex.Message);
             Plugin.Log.Error(ex, "Upload failed");
         }
         finally

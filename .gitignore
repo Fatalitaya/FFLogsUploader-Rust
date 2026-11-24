@@ -33,3 +33,5 @@ devPlugins/
 *.bak
 *.swp
 *~
+/worker/target/
+/workers/

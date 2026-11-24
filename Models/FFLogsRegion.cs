@@ -28,7 +28,7 @@ public static class FFLogsRegionExtensions
     /// <summary>
     /// Display names for UI combo boxes, indexed by combo position.
     /// </summary>
-    public static readonly string[] DisplayNames = { "NA", "EU", "JP", "OC" };
+    public static readonly string[] DisplayNames = { Loc.Text("NA"), Loc.Text("EU"), Loc.Text("JP"), Loc.Text("OC") };
 
     /// <summary>
     /// Maps combo index to the serverOrRegion API value.

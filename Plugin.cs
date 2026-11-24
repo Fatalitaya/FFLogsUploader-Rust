@@ -28,6 +28,7 @@ public sealed class Plugin : IDalamudPlugin
 
     public Plugin()
     {
+        Loc.Initialize(PluginInterface.UiLanguage);
         Configuration = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
 
         // Initialize services
@@ -46,7 +47,7 @@ public sealed class Plugin : IDalamudPlugin
 
         CommandManager.AddHandler(CommandName, new CommandInfo(OnCommand)
         {
-            HelpMessage = "Open the FFLogs uploader window"
+            HelpMessage = Loc.Text("Open the FFLogs uploader window")
         });
 
         PluginInterface.UiBuilder.Draw += DrawUI;
@@ -82,13 +83,20 @@ public sealed class Plugin : IDalamudPlugin
         MainWindow.Dispose();
         ParseViewerWindow.Dispose();
 
-        // Stop live logging and wait for it to finish before disposing the parser engine,
-        // otherwise the V8 engine could be disposed while still executing JS.
-        FFLogsService.StopLiveLog();
-        FFLogsService.WaitForLiveLogAsync().GetAwaiter().GetResult();
-        ParserService.Dispose();
-
-        CommandManager.RemoveHandler(CommandName);
+        // Give live logging time to send its final fight before closing active sessions.
+        var liveTask = FFLogsService.StopLiveLogForUnload();
+        try
+        {
+            if (!liveTask.Wait(System.TimeSpan.FromSeconds(5)))
+                Log.Warning("[LiveLog] Final upload timed out during unload, cancelling requests and stopping workers");
+        }
+        finally
+        {
+            FFLogsService.Shutdown();
+            ParserService.Dispose();
+            CommandManager.RemoveHandler(CommandName);
+        }
+        liveTask.GetAwaiter().GetResult();
     }
 
     private void OnCommand(string command, string args)

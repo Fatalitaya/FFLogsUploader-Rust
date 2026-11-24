@@ -7,7 +7,29 @@ on:
   workflow_dispatch:  # Allows manual triggering
 
 jobs:
+  worker:
+    strategy:
+      matrix:
+        include:
+          - { runner: windows-2022, rid: win-x64, binary: fflogs-worker.exe }
+          - { runner: ubuntu-22.04, rid: linux-x64, binary: fflogs-worker }
+          - { runner: macos-15-intel, rid: osx-x64, binary: fflogs-worker }
+          - { runner: macos-15, rid: osx-arm64, binary: fflogs-worker }
+    runs-on: ${{ matrix.runner }}
+    env:
+      CARGO_HOME: ${{ github.workspace }}/.cargo-cache
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --locked --release --manifest-path worker/Cargo.toml
+      - run: cargo build --locked --release --manifest-path worker/Cargo.toml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.rid }}
+          path: worker/target/release/${{ matrix.binary }}
+          if-no-files-found: error
+
   build:
+    needs: worker
     runs-on: ubuntu-latest
     permissions:
       contents: write  # Required to create releases
@@ -28,12 +50,18 @@ jobs:
           wget -q https://goatcorp.github.io/dalamud-distrib/stg/latest.zip -O dalamud.zip || curl -sL https://goatcorp.github.io/dalamud-distrib/stg/latest.zip -o dalamud.zip
           unzip -q dalamud.zip -d ~/dalamud
 
+      - uses: actions/download-artifact@v4
+        with:
+          path: workers
       - name: Build
         run: |
-          dotnet build FFLogsPlugin.csproj -c Release -p:DalamudLibPath=$HOME/dalamud
+          dotnet build FFLogsPlugin.csproj -c Release -p:PrebuiltWorkers=true -p:DalamudLibPath=$HOME/dalamud
 
       - name: Package
         run: |
+          for rid in win-x64 linux-x64 osx-x64 osx-arm64; do
+            unzip -Z1 bin/Release/FFLogsPlugin/latest.zip | grep -Eq "^workers/$rid/fflogs-worker(\.exe)?$" || exit 1
+          done
           mkdir -p release
           cp bin/Release/FFLogsPlugin/latest.zip release/latest.zip
 

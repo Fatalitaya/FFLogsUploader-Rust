@@ -14,6 +14,8 @@ using FFLogsPlugin.Models;
 
 namespace FFLogsPlugin.Services;
 
+public sealed record LiveLogState(bool Active, int FightCount, string? ReportCode, UploadProgress? Progress);
+
 /// <summary>
 /// Handles all FFLogs API communication: login, report creation, uploads.
 /// </summary>
@@ -48,9 +50,9 @@ public class FFLogsService
     public HttpClient HttpClient { get; }
     
     public bool IsLoggedIn { get; private set; }
-    public string? CurrentReportCode { get; private set; }
     public string? Username { get; private set; }
-    public List<GuildInfo> Guilds { get; private set; } = new();
+    private volatile IReadOnlyList<GuildInfo> guilds = Array.Empty<GuildInfo>();
+    public IReadOnlyList<GuildInfo> Guilds => guilds;
 
     // From the login response's enabledFeatures. When true the account may upload fights
     // while they're still in progress (real-time live logging); otherwise in-progress
@@ -58,14 +60,35 @@ public class FFLogsService
     public bool RealTimeLiveLoggingEnabled { get; private set; }
 
     // Recently uploaded report codes (for Parse Viewer)
-    public List<string> RecentReportCodes { get; } = new();
+    private readonly List<string> recentReports = new();
+    public IReadOnlyList<string> RecentReportCodes
+    {
+        get { lock (recentReports) return recentReports.ToArray(); }
+    }
     private const int MaxRecentReports = 10;
 
     // Live logging state
-    public bool IsLiveLogging { get; private set; }
-    public int LiveFightCount { get; private set; }
+    private readonly object liveLock = new();
+    private LiveLogState liveState = new(false, 0, null, null);
+    public LiveLogState LiveState { get { lock (liveLock) return liveState; } }
+    private bool unloading;
+
+    internal void SetLiveProgress(UploadProgress progress)
+    {
+        lock (liveLock) liveState = liveState with { Progress = progress };
+    }
+
     private CancellationTokenSource? liveLogCts;
     private Task? liveLogTask;
+    private readonly CancellationTokenSource shutdown = new();
+
+    internal CancellationToken ShutdownToken => shutdown.Token;
+
+    internal void Shutdown()
+    {
+        shutdown.Cancel();
+        HttpClient.CancelPendingRequests();
+    }
 
     public FFLogsService(Plugin plugin)
     {
@@ -203,7 +226,7 @@ public class FFLogsService
             Plugin.Log.Debug("[Login] Posting to /desktop-client/log-in...");
             using var request = new HttpRequestMessage(HttpMethod.Post, "/desktop-client/log-in") { Content = JsonBody(json) };
             ApplyArchonHeaders(request, RequestKind.JsonApi);
-            var response = await HttpClient.SendAsync(request);
+            using var response = await HttpClient.SendAsync(request, shutdown.Token);
             
             Plugin.Log.Debug($"[Login] Response status: {response.StatusCode}");
             var responseBody = await response.Content.ReadAsStringAsync();
@@ -233,7 +256,7 @@ public class FFLogsService
                 Plugin.Log.Information($"[Login] realTimeLiveLogging={RealTimeLiveLoggingEnabled}");
 
                 // Parse guilds
-                Guilds.Clear();
+                var parsedGuilds = new List<GuildInfo>();
                 if (user.TryGetProperty("guilds", out var guildsArray))
                 {
                     foreach (var guild in guildsArray.EnumerateArray())
@@ -241,13 +264,14 @@ public class FFLogsService
                         var guildInfo = new GuildInfo
                         {
                             Id = guild.GetProperty("id").GetInt32().ToString(),
-                            Name = guild.GetProperty("name").GetString() ?? "Unknown"
+                            Name = guild.GetProperty("name").GetString() ?? Loc.Text("Unknown")
                         };
-                        Guilds.Add(guildInfo);
+                        parsedGuilds.Add(guildInfo);
                         Plugin.Log.Debug($"[Login] Found guild: {guildInfo.Name}");
                     }
                 }
-                Plugin.Log.Information($"[Login] Found {Guilds.Count} guilds");
+                guilds = parsedGuilds.AsReadOnly();
+                Plugin.Log.Information($"[Login] Found {parsedGuilds.Count} guilds");
             }
             catch (Exception ex)
             {
@@ -324,170 +348,149 @@ public class FFLogsService
         Plugin.Log.Debug($"[CreateReport] POST /desktop-client/create-report: {json}");
         using var request = new HttpRequestMessage(HttpMethod.Post, "/desktop-client/create-report") { Content = JsonBody(json) };
         ApplyArchonHeaders(request, RequestKind.JsonApi);
-        var response = await HttpClient.SendAsync(request);
+        using var response = await HttpClient.SendAsync(request, shutdown.Token);
         
         var responseBody = await response.Content.ReadAsStringAsync();
         Plugin.Log.Debug($"[CreateReport] Response: {response.StatusCode} - {responseBody}");
         
         if (response.StatusCode != System.Net.HttpStatusCode.OK)
         {
-            throw new Exception($"Create report failed: {response.StatusCode} - {responseBody}");
+            throw new Exception(Loc.Format("Create report failed: {0} - {1}", response.StatusCode, responseBody));
         }
 
+        string? createdCode;
         // Response may be just the code as a string or JSON with "code" field
         try
         {
             using var doc = JsonDocument.Parse(responseBody);
-            CurrentReportCode = doc.RootElement.GetProperty("code").GetString();
+            createdCode = doc.RootElement.GetProperty("code").GetString();
         }
         catch
         {
-            CurrentReportCode = responseBody.Trim().Trim('"');
+            createdCode = responseBody.Trim().Trim('"');
         }
         
-        Plugin.Log.Information($"[CreateReport] Created report: {CurrentReportCode}");
-        return CurrentReportCode ?? throw new Exception("No report code in response");
+        Plugin.Log.Information($"[CreateReport] Created report: {createdCode}");
+        return createdCode ?? throw new Exception(Loc.Text("No report code in response"));
     }
 
     public async Task<string> UploadLogAsync(string logPath, int region, int visibility, string? guildId, string description)
     {
+        plugin.ParserService.Progress(false, Loc.Text("Preparing parser"));
         // 0. Make sure the parser bundle (and thus its parserVersion) is known before
         //    create-report advertises it. Cheap when the bundle is already cached.
         await plugin.ParserService.EnsureParserVersionAsync();
 
+        plugin.ParserService.Progress(false, Loc.Text("Creating report"));
         // 1. Create report
         var reportCode = await CreateReportAsync(logPath, description, visibility, region, guildId, LogModeBulkFile);
 
-        // 2. Process log with parser — returns one FightUpload per fight, each with a
-        // slim master table scoped to that fight only (matches official client output).
-        var uploads = await plugin.ParserService.ProcessLogAsync(logPath, reportCode, region);
-
-        // 3. Upload each fight segment with its own master table.
-        for (int i = 0; i < uploads.Count; i++)
+        try
         {
-            int segmentId = i + 1;
-            var u = uploads[i];
-            await WithRetryAsync(() => UploadMasterTableAsync(reportCode, u.Master, segmentId));
-            await WithRetryAsync(() => UploadSegmentAsync(reportCode, u.Fight, segmentId, u.FightStartTime, u.FightEndTime));
+            await Task.Run(() => plugin.ParserService.RunAsync(logPath, region, reportCode, false, true,
+                async segment =>
+                {
+                    await SendSegmentFiles(reportCode, segment, false);
+                    return reportCode;
+                }), shutdown.Token);
         }
-
-        // 4. Terminate the report
+        catch (Exception ex)
+        {
+            await ClosePartialReport(reportCode);
+            throw new IOException(Loc.Format("Report {0}: {1}", reportCode, ex.Message), ex);
+        }
+        plugin.ParserService.Progress(false, Loc.Text("Finalizing report"));
         await TerminateReportAsync(reportCode);
+        plugin.ParserService.Progress(false, Loc.Text("Complete"), 1, 1);
 
         TrackReportCode(reportCode);
         Plugin.Log.Information($"Upload complete: {reportCode}");
         return reportCode;
     }
 
-    public async Task StartLiveLogAsync(string logDirectory, int region, int visibility, string? guildId, string description, bool uploadPreviousFights = true)
+    public Task StartLiveLogAsync(string logDirectory, int region, int visibility, string? guildId, string description, bool uploadPreviousFights = true)
     {
-        if (IsLiveLogging)
+        lock (liveLock)
         {
-            Plugin.Log.Warning("Live logging already in progress");
-            return;
+            if (unloading) throw new ObjectDisposedException(nameof(FFLogsService));
+            if (liveLogCts != null) return liveLogTask!;
+            var session = new CancellationTokenSource();
+            liveLogCts = session;
+            liveState = new(true, 0, null, new(Loc.Text("Preparing parser")));
+            return liveLogTask = Task.Run(() => RunSession(session));
         }
 
-        liveLogCts = new CancellationTokenSource();
-        IsLiveLogging = true;
-        LiveFightCount = 0;
-        CurrentReportCode = null;
-
-        liveLogTask = Task.Run(async () =>
+        async Task RunSession(CancellationTokenSource session)
         {
             string? reportCode = null;
+            bool finalizing = false;
 
             try
             {
-                await plugin.ParserService.StartLiveLogAsync(logDirectory, region, uploadPreviousFights, async (masterData, fight, segmentId, startTime, endTime, inProgressEventCount) =>
+                await plugin.ParserService.RunAsync(logDirectory, region, null, true, uploadPreviousFights, async segment =>
                 {
-                    // Create report lazily on first fight (or first in-progress push)
-                    if (reportCode == null)
-                    {
-                        Plugin.Log.Information("[LiveLog] First fight detected - creating report...");
-                        reportCode = await CreateReportAsync("live.log", description, visibility, region, guildId, LogModeLive);
-                        CurrentReportCode = reportCode;
-
-                        // Inform the parser so subsequent collect-master-info calls
-                        // can be validated against the expected report code.
-                        plugin.ParserService.SetReportCode(reportCode);
-                    }
-
-                    // A non-zero inProgressEventCount marks a provisional (real-time)
-                    // segment for a fight that hasn't committed yet.
-                    bool isRealTime = inProgressEventCount > 0;
-                    await WithRetryAsync(() => UploadMasterTableAsync(reportCode, masterData, segmentId, isRealTime));
-                    await WithRetryAsync(() => UploadSegmentAsync(reportCode, fight, segmentId, startTime, endTime, isLive: true, isRealTime: isRealTime, inProgressEventCount: inProgressEventCount));
-                    // Only count a fight once it's finalized (not on provisional re-uploads).
-                    if (inProgressEventCount == 0) LiveFightCount++;
-                }, liveLogCts.Token);
+                    reportCode ??= await CreateReportAsync("live.log", description, visibility, region, guildId, LogModeLive);
+                    lock (liveLock) liveState = liveState with { ReportCode = reportCode };
+                    await SendSegmentFiles(reportCode, segment, true);
+                    if (segment.ProvisionalCount == 0)
+                        lock (liveLock) liveState = liveState with { FightCount = liveState.FightCount + 1 };
+                    return reportCode;
+                }, session.Token);
+                if (reportCode != null)
+                {
+                    finalizing = true;
+                    plugin.ParserService.Progress(true, Loc.Text("Finalizing report"));
+                    await TerminateReportAsync(reportCode);
+                    TrackReportCode(reportCode);
+                }
+                plugin.ParserService.Progress(true, Loc.Text("Stopped"));
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (shutdown.IsCancellationRequested)
             {
+                plugin.ParserService.Progress(true, Loc.Text("Stopped"));
                 Plugin.Log.Information("[LiveLog] Cancelled");
             }
             catch (Exception ex)
             {
+                if (reportCode != null && !finalizing) await ClosePartialReport(reportCode);
+                plugin.ParserService.Progress(true, Loc.Format("Error: {0}", ex.Message));
                 Plugin.Log.Error(ex, "[LiveLog] Error");
             }
             finally
             {
-                if (reportCode != null)
+                lock (liveLock)
                 {
-                    await TerminateReportAsync(reportCode);
-                    TrackReportCode(reportCode);
-                    Plugin.Log.Information($"[LiveLog] Live logging ended. Report: {reportCode}");
+                    liveState = liveState with { Active = false };
+                    liveLogCts = null;
+                    session.Dispose();
                 }
-                else
-                {
-                    Plugin.Log.Information("[LiveLog] Live logging ended. No fights were uploaded.");
-                }
-
-                IsLiveLogging = false;
             }
-        });
+        }
     }
 
-    /// <summary>
-    /// Waits for any active live log task to finish. Called during plugin disposal
-    /// to ensure the V8 engine isn't disposed while still in use.
-    /// </summary>
-    public async Task WaitForLiveLogAsync(int timeoutMs = 5000)
+    internal Task StopLiveLogForUnload()
     {
-        if (liveLogTask == null) return;
-
-        // Signal cancellation first
-        liveLogCts?.Cancel();
-
-        // Wait for the task to complete (with timeout to avoid hanging disposal)
-        try
+        lock (liveLock)
         {
-            await liveLogTask.WaitAsync(TimeSpan.FromMilliseconds(timeoutMs));
-        }
-        catch (TimeoutException)
-        {
-            Plugin.Log.Warning("[LiveLog] Live log task did not finish within timeout during disposal");
-        }
-        catch (Exception)
-        {
-            // Task already completed with error — that's fine
+            unloading = true;
+            liveLogCts?.Cancel();
+            return liveLogTask ?? Task.CompletedTask;
         }
     }
 
     private void TrackReportCode(string code)
     {
-        RecentReportCodes.Remove(code);
-        RecentReportCodes.Insert(0, code);
-        while (RecentReportCodes.Count > MaxRecentReports)
-            RecentReportCodes.RemoveAt(RecentReportCodes.Count - 1);
+        lock (recentReports)
+        {
+            recentReports.Remove(code);
+            recentReports.Insert(0, code);
+            if (recentReports.Count > MaxRecentReports) recentReports.RemoveAt(MaxRecentReports);
+        }
     }
 
     public void StopLiveLog()
     {
-        if (!IsLiveLogging)
-            return;
-            
-        Plugin.Log.Information("[LiveLog] Stopping live logging...");
-        liveLogCts?.Cancel();
+        lock (liveLock) liveLogCts?.Cancel();
     }
 
     /// <summary>
@@ -497,16 +500,17 @@ public class FFLogsService
     {
         for (int attempt = 0; attempt <= maxRetries; attempt++)
         {
+            shutdown.Token.ThrowIfCancellationRequested();
             try
             {
                 await action();
                 return;
             }
-            catch (Exception ex) when (attempt < maxRetries)
+            catch (Exception ex) when (attempt < maxRetries && !shutdown.IsCancellationRequested)
             {
                 var delay = TimeSpan.FromSeconds(Math.Pow(2, attempt)); // 1s, 2s, 4s
                 Plugin.Log.Warning($"[Retry] Attempt {attempt + 1}/{maxRetries} failed: {ex.Message}. Retrying in {delay.TotalSeconds}s...");
-                await Task.Delay(delay);
+                await Task.Delay(delay, shutdown.Token);
             }
         }
     }
@@ -521,35 +525,6 @@ public class FFLogsService
         return $"----WebKitFormBoundary{new string(suffix)}";
     }
 
-    /// <summary>
-    /// Computes a per-fight endTime as globalStart + last-event relative time, parsed
-    /// from the fight's eventsString buffer. Falls back to <paramref name="fallback"/>
-    /// if the buffer contains no parseable event rows.
-    /// </summary>
-    private static long ComputeFightEndTime(long globalStart, string eventsString, long fallback)
-    {
-        if (string.IsNullOrEmpty(eventsString)) return fallback;
-
-        int end = eventsString.Length;
-        while (end > 0 && (eventsString[end - 1] == '\n' || eventsString[end - 1] == '\r'))
-            end--;
-        if (end == 0) return fallback;
-
-        int firstNewline = eventsString.IndexOf('\n');
-        int secondNewline = firstNewline >= 0 ? eventsString.IndexOf('\n', firstNewline + 1) : -1;
-        if (secondNewline < 0) return fallback;
-
-        int lineStart = eventsString.LastIndexOf('\n', end - 1) + 1;
-        if (lineStart <= secondNewline) return fallback;
-
-        int pipe = eventsString.IndexOf('|', lineStart, end - lineStart);
-        if (pipe < 0) return fallback;
-
-        return long.TryParse(eventsString.AsSpan(lineStart, pipe - lineStart), out var rel)
-            ? globalStart + rel
-            : fallback;
-    }
-
     private static HttpContent CreateStringPart(string name, string value)
     {
         var content = new StringContent(value);
@@ -561,28 +536,28 @@ public class FFLogsService
         return content;
     }
 
-    private static HttpContent CreateFilePart(string name, string filename, byte[] data)
+    private HttpContent CreateFilePart(string path, bool live, string stage)
     {
-        var content = new ByteArrayContent(data);
+        var content = new SegmentFileContent(path, (sent, length) => plugin.ParserService.Progress(live, stage, sent, length));
         content.Headers.Clear();
         // Add headers in exact order to match the official client
-        content.Headers.TryAddWithoutValidation("Content-Disposition", $"form-data; name=\"{name}\"; filename=\"{filename}\"");
+        content.Headers.TryAddWithoutValidation("Content-Disposition", "form-data; name=\"logfile\"; filename=\"blob\"");
         content.Headers.TryAddWithoutValidation("Content-Type", "application/zip");
         return content;
     }
 
-    private async Task UploadMasterTableAsync(string reportCode, ParserService.MasterInfo master, int segmentId = 1, bool isRealTime = false)
+    private async Task SendSegmentFiles(string reportCode, Segment segment, bool live)
     {
-        using var memoryStream = new MemoryStream();
-        using (var zipArchive = new System.IO.Compression.ZipArchive(memoryStream, System.IO.Compression.ZipArchiveMode.Create, true))
-        {
-            var entry = zipArchive.CreateEntry("log.txt");
-            using var entryStream = entry.Open();
-            using var writer = new StreamWriter(entryStream);
-            await writer.WriteAsync(master.Table);
-        }
+        plugin.ParserService.Progress(live, Loc.Format("Uploading segment {0} master table", segment.Id));
+        await WithRetryAsync(() => UploadMasterTableAsync(reportCode, segment, live));
+        plugin.ParserService.Progress(live, Loc.Format("Uploading segment {0} events", segment.Id));
+        await WithRetryAsync(() => UploadSegmentAsync(reportCode, segment, live));
+    }
 
-        var zipBytes = memoryStream.ToArray();
+    private async Task UploadMasterTableAsync(string reportCode, Segment segment, bool live)
+    {
+        var segmentId = segment.Id;
+        var isRealTime = segment.ProvisionalCount > 0;
         var boundary = GenerateWebKitBoundary();
         using var content = new MultipartFormDataContent(boundary);
         // .NET quotes the boundary by default; the FFLogs server expects an
@@ -593,9 +568,11 @@ public class FFLogsService
         // Field order matches Archon 9.5.0: segmentId, isRealTime, logfile, players.
         content.Add(CreateStringPart("segmentId", segmentId.ToString()));
         content.Add(CreateStringPart("isRealTime", isRealTime.ToString().ToLower()));
-        content.Add(CreateFilePart("logfile", "blob", zipBytes));
+        content.Add(CreateFilePart(Path.Combine(segment.Folder, "master.zip"), live, Loc.Format("Uploading segment {0} master table", segment.Id)));
         // "players" roster added in Archon 9.5.0 / parser 3075.
-        content.Add(CreateStringPart("players", master.Players));
+        var players = new StreamContent(File.OpenRead(Path.Combine(segment.Folder, "players.txt")));
+        players.Headers.TryAddWithoutValidation("Content-Disposition", "form-data; name=\"players\"");
+        content.Add(players);
 
         using var request = new HttpRequestMessage(HttpMethod.Post, $"/desktop-client/set-report-master-table/{reportCode}")
         {
@@ -603,38 +580,24 @@ public class FFLogsService
         };
         ApplyArchonHeaders(request, RequestKind.Multipart);
 
-        var response = await HttpClient.SendAsync(request);
+        using var response = await HttpClient.SendAsync(request, shutdown.Token);
         response.EnsureSuccessStatusCode();
         
         Plugin.Log.Debug($"Master table uploaded for {reportCode}");
     }
 
-    private async Task UploadSegmentAsync(string reportCode, FightData fight, int segmentId, long startTime, long endTime, bool isLive = false, bool isRealTime = false, int inProgressEventCount = 0)
+    private async Task UploadSegmentAsync(string reportCode, Segment segment, bool isLive)
     {
-        // Format events: header + count + events. Use the parser-provided eventCount
-        // (numeric eventId delta, not line count) to match the official client exactly.
-        var eventsContent = $"{fight.LogVersion}|{fight.GameVersion}\n{fight.EventCount}\n{fight.EventsString}";
-        
-        using var memoryStream = new MemoryStream();
-        using (var zipArchive = new System.IO.Compression.ZipArchive(memoryStream, System.IO.Compression.ZipArchiveMode.Create, true))
-        {
-            var entry = zipArchive.CreateEntry("log.txt");
-            using var entryStream = entry.Open();
-            using var writer = new StreamWriter(entryStream);
-            await writer.WriteAsync(eventsContent);
-        }
-
-        var zipBytes = memoryStream.ToArray();
-        
-        // Official client sends logfile first, then parameters as a JSON field
+        var segmentId = segment.Id;
+        var isRealTime = segment.ProvisionalCount > 0;
         var parameters = JsonSerializer.Serialize(new
         {
-            startTime,
-            endTime,
+            startTime = segment.Start,
+            endTime = segment.End,
             mythic = 0,
             isLiveLog = isLive,
             isRealTime,
-            inProgressEventCount,
+            inProgressEventCount = segment.ProvisionalCount,
             segmentId
         });
 
@@ -645,7 +608,7 @@ public class FFLogsService
         formContent.Headers.Remove("Content-Type");
         formContent.Headers.TryAddWithoutValidation("Content-Type", $"multipart/form-data; boundary={boundary}");
 
-        formContent.Add(CreateFilePart("logfile", "blob", zipBytes));
+        formContent.Add(CreateFilePart(Path.Combine(segment.Folder, "events.zip"), isLive, Loc.Format("Uploading segment {0} events", segment.Id)));
         formContent.Add(CreateStringPart("parameters", parameters));
 
         using var request = new HttpRequestMessage(HttpMethod.Post, $"/desktop-client/add-report-segment/{reportCode}")
@@ -654,10 +617,18 @@ public class FFLogsService
         };
         ApplyArchonHeaders(request, RequestKind.Multipart);
 
-        var response = await HttpClient.SendAsync(request);
+        using var response = await HttpClient.SendAsync(request, shutdown.Token);
         response.EnsureSuccessStatusCode();
         
         Plugin.Log.Debug($"Segment {segmentId} uploaded for {reportCode} (isLive={isLive})");
+    }
+
+    private async Task ClosePartialReport(string reportCode)
+    {
+        if (shutdown.IsCancellationRequested) return;
+        try { await TerminateReportAsync(reportCode); }
+        catch (Exception ex) { Plugin.Log.Warning($"Could not finalize partial report {reportCode}: {ex.Message}"); }
+        TrackReportCode(reportCode);
     }
 
     private async Task TerminateReportAsync(string reportCode)
@@ -668,10 +639,10 @@ public class FFLogsService
             {
                 using var request = new HttpRequestMessage(HttpMethod.Post, $"/desktop-client/terminate-report/{reportCode}") { Content = EmptyBody() };
                 ApplyArchonHeaders(request, RequestKind.EmptyPost);
-                var response = await HttpClient.SendAsync(request);
+                using var response = await HttpClient.SendAsync(request, shutdown.Token);
                 if (!response.IsSuccessStatusCode)
                 {
-                    throw new HttpRequestException($"Terminate failed with status {response.StatusCode}");
+                    throw new HttpRequestException(Loc.Format("Terminate failed with status {0}", response.StatusCode));
                 }
                 Plugin.Log.Debug($"Report terminated: {reportCode}");
             });
@@ -680,19 +651,9 @@ public class FFLogsService
         {
             Plugin.Log.Warning($"[TerminateReport] Failed to terminate report {reportCode} after {MaxRetries} retries: {ex.Message}. " +
                                "The report may be left in an incomplete state on FFLogs — check the website.");
+            throw;
         }
     }
-}
-
-public class FightData
-{
-    public string Name { get; set; } = string.Empty;
-    public long StartTime { get; set; }
-    public long EndTime { get; set; }
-    public string EventsString { get; set; } = string.Empty;
-    public int EventCount { get; set; }
-    public int LogVersion { get; set; } = 72;
-    public int GameVersion { get; set; } = 1;
 }
 
 public class GuildInfo

@@ -45,7 +45,7 @@ public class ReportFight
             string status;
             if (Kill)
             {
-                status = "✓";
+                status = Loc.Text("✓");
             }
             else if (BossPercentage.HasValue)
             {
@@ -53,13 +53,13 @@ public class ReportFight
             }
             else
             {
-                status = "wipe";
+                status = Loc.Text("wipe");
             }
 
             var timeStr = WallClockStart.HasValue
-                ? WallClockStart.Value.ToLocalTime().ToString("h:mm tt")
+                ? WallClockStart.Value.ToLocalTime().ToString("t", Loc.Culture)
                 : "";
-            return $"{Name} ({DurationString}) {timeStr} {status}";
+            return Loc.Format("{0} ({1}) {2} {3}", Name, DurationString, timeStr, status);
         }
     }
 }

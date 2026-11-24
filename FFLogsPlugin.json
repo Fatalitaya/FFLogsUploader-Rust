@@ -1,8 +1,8 @@
 {
     "Author": "Robert5204",
-    "Name": "FFLogs Uploader",
-    "Punchline": "Upload combat logs to FFLogs directly from the game",
-    "Description": "A plugin that allows you to upload ACT combat logs to FFLogs without leaving the game. Supports both live logging and manual log uploads.",
+    "Name": "FFLogs 上传器",
+    "Punchline": "在游戏内将 ACT 战斗日志上传至 FFLogs",
+    "Description": "使用 FFLogs 账号登录后，可以在战斗时实时上传 ACT 日志，也可以手动选择已有日志文件上传。配置 FFLogs API 客户端后，还可以在游戏内查看战斗评分。",
     "ApplicableVersion": "any",
     "Tags": [
         "fflogs",

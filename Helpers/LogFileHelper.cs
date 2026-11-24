@@ -1,9 +1,6 @@
 using System;
-using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
 
 namespace FFLogsPlugin.Helpers;
 
@@ -102,64 +99,4 @@ public static class LogFileHelper
         return path;
     }
 
-    /// <summary>
-    /// Read all lines from a file while allowing other processes (like ACT) to continue writing.
-    /// Uses FileShare.ReadWrite to avoid locking conflicts.
-    /// </summary>
-    public static async Task<string[]> ReadAllLinesSharedAsync(string path)
-    {
-        var lines = new List<string>();
-        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-        using var reader = new StreamReader(fs);
-        
-        string? line;
-        while ((line = await reader.ReadLineAsync()) != null)
-        {
-            lines.Add(line);
-        }
-        
-        return lines.ToArray();
-    }
-
-    /// <summary>
-    /// Read new lines from a log file starting from a byte position.
-    /// Uses FileShare.ReadWrite to avoid locking conflicts.
-    /// Handles file truncation (e.g. log rotation) by resetting position.
-    /// </summary>
-    public static async Task<(List<string> lines, long newPosition)> ReadNewLinesSharedAsync(string logPath, long position)
-    {
-        var lines = new List<string>();
-        var newPosition = position;
-        
-        try
-        {
-            using var stream = new FileStream(logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-            
-            // If file was truncated (new log / rotation), reset position
-            if (stream.Length < position)
-            {
-                newPosition = 0;
-                Plugin.Log.Debug("[LogFileHelper] File truncated, resetting position");
-            }
-            
-            stream.Seek(newPosition, SeekOrigin.Begin);
-            
-            using var reader = new StreamReader(stream, Encoding.UTF8);
-            string? line;
-            while ((line = await reader.ReadLineAsync()) != null)
-            {
-                var cleanLine = line.Replace("\0", "").Trim();
-                if (!string.IsNullOrEmpty(cleanLine))
-                    lines.Add(cleanLine);
-            }
-            
-            newPosition = stream.Position;
-        }
-        catch (Exception ex)
-        {
-            Plugin.Log.Debug($"[LogFileHelper] Read error: {ex.Message}");
-        }
-        
-        return (lines, newPosition);
-    }
 }
